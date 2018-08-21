@@ -1,0 +1,162 @@
+---
+title: "Backblaze harddrive data"
+output: html_notebook
+---
+First, load the relevant packages.
+```{r message=FALSE}
+library(tidyverse) # For exploratory data analysis; dplyr, ggplot2, etc.
+library(feather) # For reading in the data (the actual reading is done in a separate script)
+```
+
+Read in one daily file and explore the contents.
+```{r echo=TRUE, message=FALSE}
+data <- read_csv("data/2018Q2/2018-04-01.csv", progress = FALSE)
+head(data)
+```
+
+Read all files in one `tbl_df`:
+```{r echo=TRUE}
+if (!file.exists("data/all_data.feather")) {
+  source("read_data.R")
+}
+
+tbl <- read_feather("data/all_data.feather")
+```
+
+Let's drop the [S.M.A.R.T. values](https://en.wikipedia.org/wiki/S.M.A.R.T.) for now.
+```{r echo=TRUE}
+drive_data_small <- tbl %>%
+  select(-starts_with("smart"))
+```
+
+### Exploratory plots:
+```{r echo=FALSE}
+drive_data_small %>%
+  group_by(date) %>%
+  summarise(total_size_tb = sum(capacity_bytes) / 1E12) %>%
+  ggplot(aes(x = date, y = total_size_tb)) +
+    geom_bar(stat = "identity") +
+    labs(title = "Total storage size (TB)")
+```
+```{r echo=FALSE}
+drive_data_small %>%
+  group_by(date) %>%
+  summarise(num_drives = n()) %>%
+  ggplot(aes(x = date, y = num_drives)) +
+    geom_bar(stat = "identity") +
+    labs(title = "Total number of drives")
+```
+
+```{r echo=FALSE}
+drive_data_small %>%
+  group_by(date) %>%
+  summarise(num_drives = n(), total_size_tb = sum(capacity_bytes) / 1E12) %>%
+  mutate(avg_drive_size_tb = total_size_tb / num_drives) %>%
+  ggplot(aes(x = date, y = avg_drive_size_tb)) +
+    geom_line() +
+    labs(title = "Average drive size (TB)")
+
+```
+```{r echo=FALSE}
+drive_data_small <- drive_data_small %>%
+  mutate(size_category = case_when(capacity_bytes < 4E12                           ~ "<4 TB",
+                                   capacity_bytes > 4E12 & capacity_bytes < 4.5E12 ~ "4 TB",
+                                   capacity_bytes > 4.5E12 & capacity_bytes < 8E12 ~ "4.5 - 7.5 TB",
+                                   capacity_bytes > 8E12 & capacity_bytes < 8.5E12 ~ "8 TB",
+                                   capacity_bytes > 8.5E12                         ~  ">8 TB")) %>%
+  mutate(size_category = factor(size_category, levels = rev(c("<4 TB", "4 TB", "4.5 - 7.5 TB", "8 TB", ">8 TB"))))
+
+drive_data_small %>%
+  group_by(date, size_category) %>%
+  ggplot(aes(x = date, fill = size_category)) +
+    geom_bar(position = "fill") +
+    labs(title = "Distribution of drive sizes")
+```
+
+```{r echo=FALSE, message=FALSE}
+total_storage_day <- drive_data_small %>%
+  group_by(date) %>%
+  summarise(total_storage_day_tb = sum(capacity_bytes) / 1E12)
+
+drive_data_small %>%
+  group_by(date, size_category) %>%
+  summarise(total_storage_tb = sum(capacity_bytes) / 1E12) %>%
+  left_join(total_storage_day) %>%
+  mutate(share_of_storage = total_storage_tb / total_storage_day_tb) %>%
+  ggplot(aes(x = date, y = share_of_storage, color = size_category)) +
+    geom_line() +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Share of storage from each size category")
+
+
+```
+
+```{r echo=FALSE, message=FALSE}
+total_drives_day <- drive_data_small %>%
+  group_by(date) %>%
+  summarise(total_drives = n())
+
+drive_data_small %>%
+  group_by(date, size_category) %>%
+  summarise(n_drives = n()) %>%
+  left_join(total_drives_day) %>%
+  mutate(share_of_drives = n_drives / total_drives) %>%
+  ggplot(aes(x = date, y = share_of_drives, color = size_category)) +
+    geom_line() +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Share of drives from each size category")
+
+```
+```{r echo=FALSE}
+drive_data_small %>%
+  group_by(date) %>%
+  summarise(failures = sum(failure)) %>%
+  ggplot(aes(x = date, y = failures)) +
+    geom_bar(stat = "identity") +
+    labs(title = "Drive failures") +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+### Which manufacturer is Backblaze buying the most from?
+
+```{r}
+# Infer manufacturer from model number
+drive_data_small <- 
+  drive_data_small %>%
+  mutate(manufacturer = case_when(
+                                  grepl("^ST", model) ~ "Seagate",
+                                  grepl("^HGST", model) ~ "HGST",
+                                  grepl("^Hitachi", model) ~ "Hitachi",
+                                  grepl("^TOSHIBA", model) ~ "Toshiba",
+                                  grepl("^WDC", model) ~ "Western Digital",
+                                  TRUE ~ "Other"
+                        )
+)
+
+new_drives <- drive_data_small %>%
+  group_by(serial_number, manufacturer, model) %>%
+  summarise(first = first(date), last = last(date)) %>%
+  filter(first > "2018-01-01" & last == "2018-06-30") # Only keeping drives which were not present day 1, and 
+                                                      # are still operational at the end of the period
+new_drives %>%
+  ggplot(aes(x = first, fill = manufacturer)) +           
+    geom_bar() +
+    labs(title = "Newly introduced drives by manufacturer")
+
+top_purchases <- new_drives %>% 
+  group_by(first, manufacturer, model) %>%                
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  head(15) %>%
+  mutate(weekday = lubridate::wday(first, label = TRUE)) %>%
+  print()
+
+  
+top_purchases %>%
+  filter(manufacturer == "Seagate") %>%
+  ungroup() %>%
+  summarise(bought = sum(count), cost = bought * 400)
+```
+As can be seen from the graph and associated table, the vast majority of newly introduced drives to the Backblaze park this year come from Seagate drives of the model ST12000NM0007. Searching Google for the model number gives that it is a 12 TB drive from the enterprise-grade Exos series, that retails for about $400. 
+
+Assuming Backblaze paid retail price for their drives (probably not), this represents an investment of about **$5,750,000**.
